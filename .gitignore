@@ -1,5 +1,21 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+
 # 数据目录
 my_data/
 mydata/
-__pycache__/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
 *.pyc
+
