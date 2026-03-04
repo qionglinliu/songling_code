@@ -1,0 +1,5 @@
+# 数据目录
+my_data/
+mydata/
+__pycache__/
+*.pyc
