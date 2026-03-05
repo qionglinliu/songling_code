@@ -1,0 +1,26 @@
+dataset:
+  repo_id: my_data
+  root: /home/agilex/robot/code/my_data
+  video_backend: pyav
+
+policy:
+  type: act
+  repo_id: piper_act
+  chunk_size: 100
+  n_obs_steps: 1
+  dim_model: 512
+  n_heads: 8
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+  push_to_hub: false
+
+batch_size: 2
+num_workers: 4
+steps: 20000
+save_freq: 2000
+log_freq: 100
+seed: 42
+
+output_dir: outputs/train/piper_act
+
+# action特征已通过convert_dataset.py添加
