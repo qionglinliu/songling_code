@@ -13,8 +13,8 @@ cd /home/agilex/robot/code
 
 python piper_recorder.py \
     --repo-id piper_dataset \
-    --root my_data_i \
-    --num-episodes 10 \
+    --root my_data_100 \
+    --num-episodes 100 \
     --fps 30 \
     --num-cameras 2 \
     --task "pick_place"
