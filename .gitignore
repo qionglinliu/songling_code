@@ -1,0 +1,6 @@
+my_data/
+outputs/
+*.safetensors
+*.pt
+__pycache__/
+*.pyc
