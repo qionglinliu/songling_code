@@ -6,11 +6,6 @@ Piper单臂推理脚本 - 使用训练好的LeRobot ACT模型控制机器人
   - observation.state = puppet当前位置
   - action = 发布到master目标位置
   - 摄像头: camera_f, camera_l
-  
-改进:
-  - 动作平滑 (EMA滤波 + 速度限制)
-  - 帧率监控
-  - 默认30Hz控制频率
 """
 
 import argparse
@@ -27,7 +22,7 @@ from std_msgs.msg import Header, Bool
 
 
 class PiperInferenceV2:
-    """Piper单臂推理控制器 - 左臂 (带动作平滑)"""
+    """Piper单臂推理控制器 - 左臂"""
     
     def __init__(self, checkpoint_path: str, device: str = "cuda", fps: int = 30):
         self.checkpoint_path = Path(checkpoint_path)
@@ -56,15 +51,6 @@ class PiperInferenceV2:
         self.state_std = None
         self.action_mean = None
         self.action_std = None
-        
-        # 动作平滑参数
-        self.smoothing_alpha = 0.3  # EMA平滑系数 (0=完全平滑, 1=不平滑)
-        self.max_action_change = 0.15  # 每帧最大动作变化量 (rad)
-        self.last_action = None  # 上一次动作
-        
-        # 帧率监控
-        self.frame_times = []
-        self.inference_times = []
         
     def _rosimg_to_numpy(self, msg: Image) -> np.ndarray:
         """将ROS Image消息转换为numpy数组"""
@@ -143,6 +129,7 @@ class PiperInferenceV2:
                     str(self.checkpoint_path),
                     config_filename="policy_preprocessor.json",
                 )
+                # DataProcessorPipeline 没有 .to() 方法，processor在CPU上运行
                 print(f"  Preprocessor loaded: {len(self.preprocessor.steps)} steps")
             else:
                 print("  Warning: policy_preprocessor.json not found")
@@ -154,6 +141,7 @@ class PiperInferenceV2:
                     str(self.checkpoint_path),
                     config_filename="policy_postprocessor.json",
                 )
+                # DataProcessorPipeline 没有 .to() 方法，processor在CPU上运行
                 print(f"  Postprocessor loaded: {len(self.postprocessor.steps)} steps")
             else:
                 print("  Warning: policy_postprocessor.json not found")
@@ -226,23 +214,6 @@ class PiperInferenceV2:
         """限幅动作到安全范围"""
         return np.clip(action, self.joint_limits['min'], self.joint_limits['max'])
     
-    def _smooth_action(self, action: np.ndarray) -> np.ndarray:
-        """平滑动作输出 (EMA滤波 + 速度限制)"""
-        if self.last_action is None:
-            self.last_action = action.copy()
-            return action
-        
-        # 1. EMA 平滑
-        smoothed = self.smoothing_alpha * action + (1 - self.smoothing_alpha) * self.last_action
-        
-        # 2. 速度限制 (限制每帧变化量)
-        delta = smoothed - self.last_action
-        delta = np.clip(delta, -self.max_action_change, self.max_action_change)
-        smoothed = self.last_action + delta
-        
-        self.last_action = smoothed.copy()
-        return smoothed
-    
     def _publish_action(self, action: np.ndarray):
         """发布动作到主臂 (7维)"""
         # 限幅
@@ -262,34 +233,16 @@ class PiperInferenceV2:
         self.pub_enable.publish(msg)
         rospy.loginfo(f"发布使能信号: {enable}")
     
-    def _update_stats(self, frame_time: float, inference_time: float):
-        """更新统计信息"""
-        self.frame_times.append(frame_time)
-        self.inference_times.append(inference_time)
-        # 只保留最近100帧
-        if len(self.frame_times) > 100:
-            self.frame_times.pop(0)
-            self.inference_times.pop(0)
-    
-    def _get_avg_fps(self) -> float:
-        """获取平均帧率"""
-        if len(self.frame_times) < 2:
-            return 0.0
-        avg_dt = sum(self.frame_times) / len(self.frame_times)
-        return 1.0 / avg_dt if avg_dt > 0 else 0.0
-    
     def run(self, duration: float = 60.0):
         """运行推理"""
         self._init_ros()
         self.load_model()
         
         print(f"\n" + "="*50)
-        print("开始推理控制 (带动作平滑)")
+        print("开始推理控制")
         print("="*50)
         print(f"  持续时间: {duration} 秒")
         print(f"  控制频率: {self.fps} Hz")
-        print(f"  平滑系数: {self.smoothing_alpha}")
-        print(f"  最大变化: {self.max_action_change} rad/帧")
         print(f"  控制模式: 左臂 (7维)")
         print(f"  摄像头: {self.camera_names}")
         print("="*50)
@@ -333,8 +286,6 @@ class PiperInferenceV2:
                     time.sleep(0.01)
                     continue
                 
-                inference_start = time.time()
-                
                 with torch.no_grad():
                     # 如果动作队列空了，重新推理
                     if len(action_queue) == 0:
@@ -368,21 +319,13 @@ class PiperInferenceV2:
                     if len(action_queue) > 0:
                         action = np.array(action_queue.pop(0), dtype=np.float32)
                         
-                        # 动作平滑
-                        action = self._smooth_action(action)
-                        
                         if step_count % 30 == 0:
-                            avg_fps = self._get_avg_fps()
-                            print(f"Step {step_count}: action = {action.round(4)}, FPS = {avg_fps:.1f}")
+                            print(f"Step {step_count}: action = {action.round(4)}")
                         
                         self._publish_action(action)
                         step_count += 1
                 
-                inference_time = time.time() - inference_start
-                
                 elapsed = time.time() - loop_start
-                self._update_stats(elapsed, inference_time)
-                
                 if elapsed < dt:
                     time.sleep(dt - elapsed)
                     
@@ -390,22 +333,19 @@ class PiperInferenceV2:
             print("\n用户中断")
         
         self.running = False
-        avg_fps = self._get_avg_fps()
-        print(f"\n推理完成, 总步数: {step_count}, 平均帧率: {avg_fps:.1f} Hz")
+        print(f"\n推理完成, 总步数: {step_count}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Piper单臂推理脚本 (左臂, 带动作平滑)")
+    parser = argparse.ArgumentParser(description="Piper单臂推理脚本 (左臂)")
     parser.add_argument(
         "--checkpoint", 
         default="/home/agilex/robot/code/code/outputs/train/piper_act/checkpoints/035000/pretrained_model",
         help="模型路径"
     )
     parser.add_argument("--device", default="cuda", help="设备")
-    parser.add_argument("--fps", type=int, default=30, help="控制频率 (默认30Hz)")
+    parser.add_argument("--fps", type=int, default=30, help="控制频率")
     parser.add_argument("--duration", type=float, default=60.0, help="运行时长(秒)")
-    parser.add_argument("--smoothing", type=float, default=0.3, help="平滑系数 (0=完全平滑, 1=不平滑)")
-    parser.add_argument("--max-change", type=float, default=0.08, help="每帧最大动作变化量 (rad)")
     
     args = parser.parse_args()
     
@@ -419,11 +359,6 @@ def main():
         device=args.device,
         fps=args.fps,
     )
-    
-    # 设置平滑参数
-    inference.smoothing_alpha = args.smoothing
-    inference.max_action_change = args.max_change
-    
     inference.run(duration=args.duration)
 
 
