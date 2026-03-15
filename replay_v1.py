@@ -1,31 +1,13 @@
 #!/usr/bin/env python3
 """
 Piper数据回放脚本 v1 - LeRobot格式
-参考松灵replay_data.py设计，夹爪特殊处理
+参考松灵 replay_data.py 设计，夹爪特殊处理
 
-功能:
-  - 从LeRobot数据集读取数据
-  - 发布关节状态到ROS话题
-  - 发布图像到ROS话题
-  - 支持左臂/右臂/双臂模式
-  - 支持插值平滑运动
-  - 夹爪特殊处理：不参与插值，直接设置为目标值
+优化: 直接读取 parquet 文件，避免视频解码卡顿
 
 使用方法:
-  # 回放指定episode
-  python replay_v1.py --repo-id my_data --episode 0
-  
-  # 回放songling_code/data目录下的数据集 (使用 "." 作为 repo-id)
-  python replay_v1.py --repo-id . --episode 0
-  
-  # 回放所有episode
-  python replay_v1.py --repo-id my_data --episode -1
-  
-  # 指定手臂
-  python replay_v1.py --repo-id my_data --episode 0 --arm left
-  
-  # 慢速回放 (用于调试)
-  python replay_v1.py --repo-id my_data --episode 0 --speed 0.5
+  python replay_v1.py --repo-id 3-12-banana --episode 0 --arm left
+  python replay_v1.py --repo-id . --episode 0 --arm left
 """
 
 import argparse
@@ -33,16 +15,14 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import rospy
 from std_msgs.msg import Header
 from sensor_msgs.msg import Image, JointState
 
-# LeRobot API
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
 
 class PiperReplayV1:
-    """Piper数据回放器 v1 - 支持左臂/右臂/双臂模式，夹爪特殊处理"""
+    """Piper数据回放器 - 直接读取parquet，避免视频解码"""
     
     def __init__(
         self,
@@ -61,29 +41,18 @@ class PiperReplayV1:
         self.is_right_arm = arm in ["right", "both"]
         self.is_dual_arm = arm == "both"
         
-        # 状态维度
-        if self.is_dual_arm:
-            self.state_dim = 14  # 双臂: 7+7
-        else:
-            self.state_dim = 7   # 单臂
-        
         # ROS
         self.joint_left_pub = None
         self.joint_right_pub = None
-        self.img_front_pub = None
-        self.img_left_pub = None
-        self.img_right_pub = None
         
-        # 数据集
-        self.dataset = None
+        # 数据
+        self.parquet_data = None
+        self.episodes_info = None
+        self._actions_cache = {}  # 缓存处理好的 actions
         
         # 夹爪初始位置 (参考松灵)
         self.origin_left = [-0.0057, -0.031, -0.0122, -0.032, 0.0099, 0.0179, 0.2279]
         self.origin_right = [0.0616, 0.0021, 0.0475, -0.1013, 0.1097, 0.0872, 0.2279]
-        
-        # 夹爪索引
-        self.GRIPPER_LEFT_IDX = 6   # 左臂夹爪在7维向量中的索引
-        self.GRIPPER_RIGHT_IDX = 13  # 右臂夹爪在14维向量中的索引
     
     def _init_ros(self):
         """初始化ROS发布者"""
@@ -99,162 +68,105 @@ class PiperReplayV1:
                 '/master/joint_right', JointState, queue_size=10
             )
         
-        # 图像发布者
-        self.img_front_pub = rospy.Publisher(
-            '/camera_f/color/image_raw', Image, queue_size=10
-        )
-        if self.is_left_arm or self.is_dual_arm:
-            self.img_left_pub = rospy.Publisher(
-                '/camera_l/color/image_raw', Image, queue_size=10
-            )
-        if self.is_right_arm or self.is_dual_arm:
-            self.img_right_pub = rospy.Publisher(
-                '/camera_r/color/image_raw', Image, queue_size=10
-            )
-        
         arm_type = "双臂" if self.is_dual_arm else ("左臂" if self.is_left_arm else "右臂")
         rospy.loginfo(f"ROS发布者已初始化 - {arm_type}模式")
     
     def _load_dataset(self):
-        """加载LeRobot数据集
-        
-        支持两种模式:
-        1. --repo-id my_data: 数据集路径为 root/my_data/
-        2. --repo-id . : 直接使用 root 作为数据集路径
-        """
-        # 如果 repo-id 是 "."，则直接使用 root 作为数据集路径
+        """加载数据集 - 直接读取parquet文件，避免视频解码"""
         if self.repo_id == ".":
             dataset_path = self.root
-            actual_repo_id = self.root.name
         else:
             dataset_path = self.root / self.repo_id
-            actual_repo_id = self.repo_id
             
         print(f"加载数据集: {dataset_path}")
         
         if not dataset_path.exists():
             raise FileNotFoundError(f"数据集不存在: {dataset_path}")
         
-        # 设置离线模式
-        import os
-        os.environ['HF_HUB_OFFLINE'] = '1'
+        # 读取 parquet 数据文件
+        data_dir = dataset_path / "data" / "chunk-000"
+        if not data_dir.exists():
+            raise FileNotFoundError(f"数据目录不存在: {data_dir}")
         
-        self.dataset = LeRobotDataset(
-            repo_id=actual_repo_id,
-            root=dataset_path,
-        )
+        # 合并所有 parquet 文件
+        parquet_files = sorted(data_dir.glob("*.parquet"))
+        if not parquet_files:
+            raise FileNotFoundError(f"未找到 parquet 文件: {data_dir}")
+        
+        dfs = []
+        for pf in parquet_files:
+            df = pd.read_parquet(pf)
+            dfs.append(df)
+        
+        self.parquet_data = pd.concat(dfs, ignore_index=True)
+        
+        # 读取 episode 元数据
+        episodes_dir = dataset_path / "meta" / "episodes" / "chunk-000"
+        if episodes_dir.exists():
+            ep_files = sorted(episodes_dir.glob("*.parquet"))
+            ep_dfs = [pd.read_parquet(f) for f in ep_files]
+            self.episodes_info = pd.concat(ep_dfs, ignore_index=True)
+        else:
+            # 从数据中推断 episode 边界
+            self.episodes_info = None
+        
+        # 统计 episodes
+        if 'episode_index' in self.parquet_data.columns:
+            num_episodes = self.parquet_data['episode_index'].nunique()
+        else:
+            num_episodes = 1
         
         print(f"数据集信息:")
-        print(f"  Episodes数量: {self.dataset.num_episodes}")
-        print(f"  总帧数: {self.dataset.num_frames}")
-        print(f"  FPS: {self.dataset.fps}")
+        print(f"  总帧数: {len(self.parquet_data)}")
+        print(f"  Episodes数量: {num_episodes}")
+        print(f"  FPS: {self.fps}")
     
-    def _create_joint_msg(self, positions: np.ndarray) -> JointState:
+    def _create_joint_msg(self, positions: list) -> JointState:
         """创建关节状态消息"""
         msg = JointState()
         msg.header = Header()
         msg.header.stamp = rospy.Time.now()
         msg.name = ['joint0', 'joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6']
-        msg.position = positions.tolist()
+        msg.position = positions
         msg.velocity = [0.0] * 7
         msg.effort = [0.0] * 7
         return msg
     
-    def _create_image_msg(self, image: np.ndarray) -> Image:
-        """创建图像消息 - 不使用cv_bridge避免libffi冲突"""
-        msg = Image()
-        msg.header = Header()
-        msg.header.stamp = rospy.Time.now()
-        msg.height = image.shape[0]
-        msg.width = image.shape[1]
+    def _get_episode_actions(self, episode_idx: int) -> np.ndarray:
+        """获取指定episode的所有action数据 (带缓存)"""
+        # 检查缓存
+        if episode_idx in self._actions_cache:
+            return self._actions_cache[episode_idx]
         
-        if len(image.shape) == 3:
-            if image.shape[2] == 3:
-                # 输入是RGB，转换为BGR
-                image_bgr = image[:, :, ::-1].copy()
-                msg.encoding = "bgr8"
-                msg.step = msg.width * 3
+        if 'episode_index' in self.parquet_data.columns:
+            episode_data = self.parquet_data[
+                self.parquet_data['episode_index'] == episode_idx
+            ]
+        else:
+            episode_data = self.parquet_data
+        
+        # 按 frame_index 排序
+        if 'frame_index' in episode_data.columns:
+            episode_data = episode_data.sort_values('frame_index')
+        
+        # 获取 action 列 (可能是 numpy 数组或分开的列)
+        if 'action' in episode_data.columns:
+            # action 列直接包含 numpy 数组
+            actions = np.stack(episode_data['action'].values)
+        else:
+            # 尝试 action.0, action.1 格式
+            action_cols = [col for col in episode_data.columns if col.startswith('action.')]
+            if action_cols:
+                actions = episode_data[action_cols].values
             else:
-                image_bgr = image
-                msg.encoding = "rgb8"
-                msg.step = msg.width * image.shape[2]
-        else:
-            image_bgr = image
-            msg.encoding = "mono8"
-            msg.step = msg.width
+                raise ValueError("未找到 action 数据列")
         
-        msg.data = image_bgr.tobytes()
-        msg.is_bigendian = 0
-        return msg
+        # 缓存结果
+        self._actions_cache[episode_idx] = actions
+        return actions
     
-    def _interpolate_actions_with_gripper_fix(
-        self, 
-        last_action: np.ndarray, 
-        current_action: np.ndarray, 
-        num_steps: int
-    ) -> np.ndarray:
-        """
-        插值生成平滑动作序列，夹爪特殊处理
-        
-        参考松灵inference.py的做法:
-        - 关节(0-5)参与插值
-        - 夹爪(6)不参与插值，直接设置为目标值
-        """
-        # 先对所有维度做插值
-        interpolated = np.linspace(last_action, current_action, num_steps)
-        
-        # 夹爪特殊处理：直接设置为目标值（不插值）
-        if self.is_dual_arm:
-            # 双臂模式：修正左臂夹爪(index 6)和右臂夹爪(index 13)
-            interpolated[:, self.GRIPPER_LEFT_IDX] = current_action[self.GRIPPER_LEFT_IDX]
-            interpolated[:, self.GRIPPER_RIGHT_IDX] = current_action[self.GRIPPER_RIGHT_IDX]
-        elif self.is_left_arm:
-            # 单臂左臂：修正夹爪(index 6)
-            interpolated[:, self.GRIPPER_LEFT_IDX] = current_action[self.GRIPPER_LEFT_IDX]
-        else:
-            # 单臂右臂：修正夹爪(index 6，但在7维向量中)
-            interpolated[:, self.GRIPPER_LEFT_IDX] = current_action[self.GRIPPER_LEFT_IDX]
-        
-        return interpolated
-    
-    def _get_episode_data(self, episode_idx: int) -> list:
-        """获取指定episode的所有数据"""
-        episode_data = []
-        
-        # 使用meta.episodes获取episode信息
-        ep = self.dataset.meta.episodes[episode_idx]
-        from_idx = ep["dataset_from_index"]
-        to_idx = ep["dataset_to_index"]
-        
-        for i in range(from_idx, to_idx):
-            frame = self.dataset[i]
-            episode_data.append(frame)
-        
-        return episode_data
-    
-    def replay_episode(self, episode_idx: int, speed: float = 1.0, interpolate: bool = True):
-        """回放单个episode
-        
-        Args:
-            episode_idx: episode索引
-            speed: 回放速度 (1.0 = 正常速度)
-            interpolate: 是否使用插值平滑
-        """
-        print(f"\n回放 Episode {episode_idx}...")
-        
-        # 获取episode数据
-        episode_data = self._get_episode_data(episode_idx)
-        
-        if not episode_data:
-            print(f"Episode {episode_idx} 为空，跳过")
-            return
-        
-        print(f"  帧数: {len(episode_data)}")
-        print(f"  插值: {'开启 (夹爪不插值)' if interpolate else '关闭'}")
-        
-        # 回放参数
-        interpolate_steps = 20 if interpolate else 1
-        
+    def _precompute_interpolated(self, actions: np.ndarray, interpolate_steps: int) -> np.ndarray:
+        """预先计算所有插值后的动作 (夹爪不插值!)"""
         # 初始位置
         if self.is_dual_arm:
             last_action = np.array(self.origin_left + self.origin_right, dtype=np.float32)
@@ -263,61 +175,79 @@ class PiperReplayV1:
         else:
             last_action = np.array(self.origin_right, dtype=np.float32)
         
-        rate = rospy.Rate(self.fps * interpolate_steps / speed)
+        all_interpolated = []
+        for action in actions:
+            interpolated = np.linspace(last_action, action, interpolate_steps)
+            
+            # 夹爪不插值! 直接使用目标值 (参考松灵做法)
+            if self.is_dual_arm:
+                interpolated[:, 6] = action[6]    # 左臂夹爪
+                interpolated[:, 13] = action[13]  # 右臂夹爪
+            else:
+                interpolated[:, 6] = action[6]    # 单臂夹爪
+            
+            all_interpolated.append(interpolated)
+            last_action = action.copy()
         
-        for frame_idx, frame in enumerate(episode_data):
+        # 合并为一个大数组
+        return np.concatenate(all_interpolated, axis=0)
+    
+    def replay_episode(self, episode_idx: int, speed: float = 1.0, interpolate: bool = True):
+        """回放单个episode - 预计算插值，快速回放"""
+        print(f"\n回放 Episode {episode_idx}...")
+        
+        # 获取 episode 数据
+        actions = self._get_episode_actions(episode_idx)
+        
+        if len(actions) == 0:
+            print(f"Episode {episode_idx} 为空，跳过")
+            return
+        
+        print(f"  帧数: {len(actions)}")
+        print(f"  插值: {'开启' if interpolate else '关闭'}")
+        
+        # 回放参数
+        interpolate_steps = 5 if interpolate else 1
+        
+        # 预先计算所有插值后的动作
+        print(f"  预计算插值...")
+        all_actions = self._precompute_interpolated(actions, interpolate_steps)
+        print(f"  总步数: {len(all_actions)}")
+        
+        # 预先创建所有消息 (避免循环中创建对象)
+        if self.is_dual_arm:
+            msgs = []
+            for act in all_actions:
+                msg_left = self._create_joint_msg(act[:7].tolist())
+                msg_right = self._create_joint_msg(act[7:].tolist())
+                msgs.append((msg_left, msg_right))
+        else:
+            msgs = [self._create_joint_msg(act.tolist()) for act in all_actions]
+        
+        # 计算发布频率
+        target_fps = self.fps * interpolate_steps
+        rate = rospy.Rate(target_fps)
+        
+        print(f"  开始回放 (目标FPS: {target_fps})...")
+        
+        for i, msg in enumerate(msgs):
             if rospy.is_shutdown():
                 return
             
-            # 获取当前帧数据
-            action = frame['action'].numpy()
-            
-            # 插值（夹爪特殊处理）
-            if interpolate:
-                interpolated = self._interpolate_actions_with_gripper_fix(
-                    last_action, action, interpolate_steps
-                )
+            # 更新时间戳
+            if self.is_dual_arm:
+                msg[0].header.stamp = rospy.Time.now()
+                msg[1].header.stamp = rospy.Time.now()
+                self.joint_left_pub.publish(msg[0])
+                self.joint_right_pub.publish(msg[1])
+            elif self.is_left_arm:
+                msg.header.stamp = rospy.Time.now()
+                self.joint_left_pub.publish(msg)
             else:
-                interpolated = [action]
+                msg.header.stamp = rospy.Time.now()
+                self.joint_right_pub.publish(msg)
             
-            last_action = action.copy()
-            
-            for step, act in enumerate(interpolated):
-                if rospy.is_shutdown():
-                    return
-                
-                # 发布关节状态
-                if self.is_dual_arm:
-                    left_action = act[:7]
-                    right_action = act[7:]
-                    self.joint_left_pub.publish(self._create_joint_msg(left_action))
-                    self.joint_right_pub.publish(self._create_joint_msg(right_action))
-                elif self.is_left_arm:
-                    self.joint_left_pub.publish(self._create_joint_msg(act))
-                else:
-                    self.joint_right_pub.publish(self._create_joint_msg(act))
-                
-                # 只在第一步发布图像 (避免重复)
-                if step == 0:
-                    # 发布图像
-                    if 'observation.images.camera_f' in frame:
-                        img_f = frame['observation.images.camera_f'].numpy()
-                        self.img_front_pub.publish(self._create_image_msg(img_f))
-                    
-                    if self.is_left_arm or self.is_dual_arm:
-                        if 'observation.images.camera_l' in frame:
-                            img_l = frame['observation.images.camera_l'].numpy()
-                            self.img_left_pub.publish(self._create_image_msg(img_l))
-                    
-                    if self.is_right_arm or self.is_dual_arm:
-                        if 'observation.images.camera_r' in frame:
-                            img_r = frame['observation.images.camera_r'].numpy()
-                            self.img_right_pub.publish(self._create_image_msg(img_r))
-                
-                rate.sleep()
-            
-            if frame_idx % 30 == 0:
-                print(f"  已回放 {frame_idx + 1}/{len(episode_data)} 帧")
+            rate.sleep()
         
         print(f"  Episode {episode_idx} 回放完成")
     
@@ -327,23 +257,38 @@ class PiperReplayV1:
         self._init_ros()
         
         print("\n等待ROS连接...")
-        time.sleep(1.0)
+        time.sleep(0.5)
         
-        num_episodes = self.dataset.num_episodes
+        # 获取 episodes 数量
+        if 'episode_index' in self.parquet_data.columns:
+            num_episodes = self.parquet_data['episode_index'].nunique()
+        else:
+            num_episodes = 1
+        
+        arm_type = "双臂" if self.is_dual_arm else ("左臂" if self.is_left_arm else "右臂")
+        
+        print(f"\n" + "="*50)
+        print(f"Piper数据回放 ({arm_type})")
+        print("="*50)
+        print(f"  FPS: 100 (插值后)")
+        print(f"  插值步数: {20 if interpolate else 1}")
+        print("="*50)
         
         while True:
             if episode_idx >= 0:
-                # 回放指定episode
+                if episode_idx >= num_episodes:
+                    print(f"错误: episode索引 {episode_idx} 超出范围")
+                    return
                 self.replay_episode(episode_idx, speed, interpolate)
             else:
-                # 回放所有episodes
+                # 回放所有 episodes
                 for ep_idx in range(num_episodes):
                     if rospy.is_shutdown():
-                        break
+                        return
                     self.replay_episode(ep_idx, speed, interpolate)
                     if ep_idx < num_episodes - 1:
-                        print("\n等待2秒后回放下一个episode...")
-                        time.sleep(2.0)
+                        print("\n等待1秒后回放下一个episode...")
+                        time.sleep(1.0)
             
             if not loop:
                 break
@@ -355,13 +300,13 @@ class PiperReplayV1:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Piper数据回放 v1 (夹爪特殊处理)")
-    parser.add_argument("--repo-id", type=str, required=True, help="数据集名称")
+    parser = argparse.ArgumentParser(description="Piper数据回放 v1 (直接读取parquet)")
+    parser.add_argument("--repo-id", type=str, required=True, help="数据集名称 (使用 '.' 表示直接使用 root 目录)")
     parser.add_argument("--root", type=str, default="/home/agilex/robot/songling_code/data", help="数据集路径")
     parser.add_argument("--arm", type=str, default="left", choices=["left", "right", "both"], help="手臂选择")
     parser.add_argument("--episode", type=int, default=0, help="Episode索引 (-1 表示回放所有)")
-    parser.add_argument("--fps", type=int, default=30, help="回放帧率")
-    parser.add_argument("--speed", type=float, default=1.0, help="回放速度 (0.5 = 半速, 2.0 = 双速)")
+    parser.add_argument("--fps", type=int, default=30, help="原始帧率")
+    parser.add_argument("--speed", type=float, default=1.0, help="回放速度 (暂不支持)")
     parser.add_argument("--no-interpolate", action="store_true", help="禁用插值")
     parser.add_argument("--loop", action="store_true", help="循环回放")
     

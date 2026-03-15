@@ -1,0 +1,17 @@
+# 数据集
+data/
+
+# 训练输出
+outputs/
+outputs_*/
+XVLA/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.idea/
+.vscode/
+
+# XVLA checkpoints
+XVLA/checkpoints-*/
